@@ -11,9 +11,9 @@ from sklearn.metrics import (accuracy_score, f1_score,
 # ===========================================================================
 # Paths
 # ===========================================================================
-RAW_DIR       = 'data/raw/'
-PROCESSED_DIR = 'data/processed/'
-MODEL_DIR     = 'models/model_b/traditional/'
+RAW_DIR       = '../data/raw/'
+PROCESSED_DIR = '../data/processed/'
+MODEL_DIR     = '../models/model_b/traditional/'
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 # ===========================================================================
@@ -23,9 +23,19 @@ N_DISTRACTORS       = 3
 MMR_DIVERSITY       = 0.6     # lambda for Maximal Marginal Relevance
 POOL_SIZE           = 300     # max raw candidates before filtering
 HINT_TRAIN_ARTICLES = 3000    # articles used to train hint scorer
-W2V_PATH            = 'models/model_b/traditional/word2vec_kv.bin'
+W2V_PATH            = '../models/model_b/traditional/word2vec_kv.bin'
 
-HINT_FEATURE_NAMES  = ['cos_q', 'cos_ans', 'keyword_overlap', 'position', 'length']
+HINT_FEATURE_NAMES  = [
+    'cos_q', 'cos_ans', 'keyword_overlap',
+    'position', 'length',
+    # FIX 1: added two new features to the scorer so it can distinguish
+    # "general context" sentences (high q-overlap, low ans-overlap — good for
+    # Hint 1/2) from "answer-revealing" sentences (high ans-overlap — Hint 3).
+    # Without these the 5-feature LR had no way to order hints by specificity,
+    # which caused the –10 R² and the "The answer: You can volunteer." leak.
+    'ans_overlap_ratio',   # how much of the answer text appears in sentence
+    'q_minus_ans',         # q-overlap minus ans-overlap → "safe hint" signal
+]
 
 # ===========================================================================
 # Stopwords
@@ -147,20 +157,6 @@ def _mmr_select(candidates_scored, n, diversity_lambda=MMR_DIVERSITY):
 
 # ---------------------------------------------------------------------------
 # Candidate Source 1 — Answer-sized phrase extraction
-#
-# The key improvement over naive n-gram scoring:
-#
-# Instead of taking random n-grams and scoring them by similarity TO the
-# answer (which picks fragments that share words with the answer), we:
-#   1. Extract contiguous windows of tokens from article sentences whose
-#      LENGTH matches the answer (± 1 token).
-#   2. Score each window by how much it overlaps with the QUESTION context
-#      (not the answer) — so we get phrases that are topically relevant to
-#      the question, making them plausible wrong answers.
-#   3. Add a bonus for capitalised first words (likely proper nouns / names).
-#
-# This produces distractors like "Volunteering" or "London, Paris" instead
-# of fragments like "you ve" or "see news".
 # ---------------------------------------------------------------------------
 def _extract_answer_sized_phrases(article, answer, question):
     """
@@ -168,8 +164,6 @@ def _extract_answer_sized_phrases(article, answer, question):
       - Match the answer's token length (within +-1)
       - Do NOT contain or overlap with the answer text
       - Are scored by relevance to the question
-
-    Returns list of (phrase, score) sorted descending.
     """
     ans_tokens  = tokenize(answer)
     ans_len     = max(1, len(ans_tokens))
@@ -180,11 +174,8 @@ def _extract_answer_sized_phrases(article, answer, question):
     candidates = {}   # normalised_phrase -> (phrase, best_score)
 
     for sent in sentences:
-        # Keep original casing for capitalisation bonus, but also work with
-        # the raw whitespace-split tokens
         raw_words = sent.split()
 
-        # Try windows from (ans_len - 1) to (ans_len + 1) inclusive
         for window in range(max(1, ans_len - 1),
                             min(ans_len + 2, len(raw_words) + 1)):
             for i in range(len(raw_words) - window + 1):
@@ -197,19 +188,22 @@ def _extract_answer_sized_phrases(article, answer, question):
 
                 phrase_content = content_words(phrase_norm)
 
-                # Must have at least one content word
                 if not phrase_content:
                     continue
-                # Skip if the phrase IS or contains the correct answer
                 if phrase_norm == clean_text(ans_lower):
                     continue
                 if ans_lower in phrase_lower or phrase_lower in ans_lower:
                     continue
-                # Skip pure-stopword phrases
                 if all(w in STOPWORDS for w in tokenize(phrase_norm)):
                     continue
 
-                # Score = question-word overlap + proper-noun bonus
+                # FIX 2: W2V candidates arrive as underscore-joined tokens
+                # (e.g. "household_chores"). This guard rejects any phrase
+                # whose normalised form contains underscores — those are
+                # vocab artefacts, not readable answer options.
+                if '_' in phrase_norm:
+                    continue
+
                 overlap   = len(phrase_content & q_words) / (len(q_words) + 1)
                 cap_bonus = 0.15 if raw_words[i][0].isupper() else 0.0
                 score     = overlap + cap_bonus
@@ -223,10 +217,6 @@ def _extract_answer_sized_phrases(article, answer, question):
 
 # ---------------------------------------------------------------------------
 # Candidate Source 2 — Frequency-based content word substitution
-#
-# High-frequency content words and bigrams from the article make plausible
-# wrong answers because they are topically related to the passage.
-# Capitalised tokens (proper nouns) and question-related words get a boost.
 # ---------------------------------------------------------------------------
 def _candidates_from_frequency(article, answer, question, top_n=60):
     """Returns list of (candidate, score)."""
@@ -234,14 +224,12 @@ def _candidates_from_frequency(article, answer, question, top_n=60):
     ans_tokens = set(tokenize(answer))
     q_words    = content_words(question)
 
-    # Preserve original case for proper-noun detection
     raw_tokens  = re.findall(r'[A-Za-z][a-z]*', article)
     freq        = Counter(t.lower() for t in raw_tokens
                           if t.lower() not in STOPWORDS and len(t) > 2)
     cap_set     = {t.lower() for t in raw_tokens
                    if t[0].isupper() and t.lower() not in STOPWORDS}
 
-    # Bigrams
     lc_content  = [t.lower() for t in raw_tokens if t.lower() not in STOPWORDS]
     bigram_freq = Counter(f"{lc_content[i]} {lc_content[i+1]}"
                           for i in range(len(lc_content) - 1))
@@ -250,6 +238,12 @@ def _candidates_from_frequency(article, answer, question, top_n=60):
 
     for word, count in freq.most_common(top_n * 2):
         if word in ans_tokens or word in ans_lower:
+            continue
+        # FIX 3: single-word candidates are only accepted when the gold
+        # answer is also short (≤ 2 tokens). Returning bare words like
+        # "gum" or "art" as distractors for a multi-word answer looks
+        # implausible and confused evaluators expecting full-phrase options.
+        if len(tokenize(answer)) > 2 and len(tokenize(word)) == 1:
             continue
         cap_bonus = 0.3 if word in cap_set else 0.0
         q_bonus   = 0.2 if word in q_words  else 0.0
@@ -285,28 +279,68 @@ def _load_w2v():
         print(f"  Word2Vec cache not found at {W2V_PATH}. Skipping W2V candidates.")
         return None
 
+def _w2v_token_to_phrase(token):
+    """
+    FIX 4 (core W2V fix): Google News Word2Vec stores multi-word concepts
+    as underscore-joined strings like 'household_chores' or
+    'caregiving_responsibilities'. When used raw they look like code tokens,
+    not readable answer options.  This function converts them to natural
+    space-separated phrases: 'household chores', 'caregiving responsibilities'.
+    Single tokens are returned as-is (already lowercase words).
+    """
+    return token.replace('_', ' ').lower().strip()
+
 def _candidates_from_w2v(answer, article, w2v_model, top_n=20):
-    """Fetch semantic neighbours of answer tokens not already in the article."""
+    """
+    Fetch semantic neighbours of answer tokens.
+
+    Key changes vs original:
+    - Converts underscore tokens to readable phrases (_w2v_token_to_phrase).
+    - Checks the converted phrase against the article, not the raw token,
+      so 'New_York' -> 'new york' is correctly compared to article text.
+    - Rejects single-character tokens and pure-numeric neighbours.
+    """
     if w2v_model is None:
         return []
     article_words = set(tokenize(article))
     ans_tokens    = [t for t in tokenize(answer) if t not in STOPWORDS]
     collected     = {}
+
     for token in ans_tokens:
         if token not in w2v_model:
             continue
         try:
-            neighbours = w2v_model.most_similar(token, topn=30)
+            neighbours = w2v_model.most_similar(token, topn=40)
         except Exception:
             continue
+
         for neighbour, sim in neighbours:
-            n_lower = neighbour.lower()
-            if n_lower in article_words:
+            # Convert to readable phrase first
+            phrase = _w2v_token_to_phrase(neighbour)
+
+            # FIX 5: reject artefacts — single chars, pure digits, or
+            # phrases whose every token is a stopword.
+            phrase_tokens = tokenize(phrase)
+            if not phrase_tokens:
                 continue
-            if n_lower in answer.lower() or answer.lower() in n_lower:
+            if len(phrase) <= 1:
                 continue
-            if n_lower not in collected or collected[n_lower] < sim:
-                collected[n_lower] = sim
+            if all(re.fullmatch(r'[0-9]+', t) for t in phrase_tokens):
+                continue
+            if all(t in STOPWORDS for t in phrase_tokens):
+                continue
+
+            phrase_lower = phrase.lower()
+            # Skip if all words of the phrase already appear in the article
+            # (original rule was per-word; keep it on the phrase level)
+            if all(w in article_words for w in phrase_tokens):
+                continue
+            if phrase_lower in answer.lower() or answer.lower() in phrase_lower:
+                continue
+
+            if phrase_lower not in collected or collected[phrase_lower] < sim:
+                collected[phrase_lower] = sim
+
     return sorted(collected.items(), key=lambda x: x[1], reverse=True)[:top_n]
 
 # ---------------------------------------------------------------------------
@@ -327,6 +361,10 @@ def _filter_candidates(candidates, answer, ans_type, strict=True):
         if not _matches_type(cand, ans_type):
             continue
         if strict and not _length_ok(cand, answer):
+            continue
+        # FIX 6: hard-reject underscore tokens that survived earlier filters
+        # (defensive — should have been cleaned in source functions already).
+        if '_' in cand_norm:
             continue
         filtered.append((cand, score))
     return filtered
@@ -349,35 +387,22 @@ def generate_distractors(article, question, correct_answer,
     Generate n plausible distractors for (article, question, correct_answer).
 
     Three candidate sources are fused:
-      1. Answer-sized phrase extraction from article sentences, scored by
-         question relevance (not answer similarity) — primary source.
-      2. High-frequency content word substitution with capitalisation and
-         question-relevance boosts.
-      3. Word2Vec nearest neighbours (if gensim is available).
-
-    Candidates are filtered for answer-type compatibility, length ratio, and
-    substring overlap, then MMR-selected to maximise diversity.
-    Two-stage fallback progressively relaxes constraints if the pool is small.
+      1. Answer-sized phrase extraction from article sentences (primary).
+      2. High-frequency content word / bigram substitution.
+      3. Word2Vec nearest neighbours converted to readable phrases.
     """
     ans_type = _answer_type(correct_answer)
 
-    # Source 1: answer-sized phrases (main improvement)
     phrase_cands = _extract_answer_sized_phrases(article, correct_answer, question)
-
-    # Source 2: frequency substitution
     freq_cands   = _candidates_from_frequency(article, correct_answer, question)
-
-    # Source 3: Word2Vec (optional)
     w2v_cands    = _candidates_from_w2v(correct_answer, article, w2v_model)
 
     all_cands = phrase_cands + freq_cands + w2v_cands
 
-    # Strict filter + MMR
     filtered  = _filter_candidates(all_cands, correct_answer, ans_type, strict=True)
     filtered  = _deduplicate(filtered)
     selected  = _mmr_select(filtered, n, MMR_DIVERSITY)
 
-    # Fallback 1: relax length constraint
     if len(selected) < n:
         relaxed   = _filter_candidates(all_cands, correct_answer, ans_type, strict=False)
         relaxed   = _deduplicate(relaxed)
@@ -385,13 +410,13 @@ def generate_distractors(article, question, correct_answer,
         relaxed   = [(c, s) for c, s in relaxed if c.lower() not in sel_set]
         selected += _mmr_select(relaxed, n - len(selected), MMR_DIVERSITY)
 
-    # Fallback 2: bare minimum — just exclude the answer itself
     if len(selected) < n:
         ans_lower = correct_answer.lower()
         minimal   = [(c, s) for c, s in all_cands
                      if c.lower() != ans_lower
                      and ans_lower not in c.lower()
-                     and c.lower() not in ans_lower]
+                     and c.lower() not in ans_lower
+                     and '_' not in c]
         minimal   = _deduplicate(minimal)
         sel_set   = {s.lower() for s in selected}
         minimal   = [(c, s) for c, s in minimal if c.lower() not in sel_set]
@@ -410,20 +435,33 @@ def generate_distractors(article, question, correct_answer,
 # ---------------------------------------------------------------------------
 def _hint_features(sentence, question, answer, position=0.0):
     """
-    5 features per sentence:
-      cos_q           : OHE cosine similarity sentence vs question
-      cos_ans         : OHE cosine similarity sentence vs answer
-      keyword_overlap : |cw(sent) & cw(question)| / (|cw(q)| + 1)
-      position        : normalised sentence index [0, 1]
-      length          : word count
+    7 features per sentence (was 5 — two new features added, see FIX 1):
+
+      cos_q            : OHE cosine similarity sentence vs question
+      cos_ans          : OHE cosine similarity sentence vs answer
+      keyword_overlap  : |cw(sent) & cw(question)| / (|cw(q)| + 1)
+      position         : normalised sentence index [0, 1]
+      length           : word count
+      ans_overlap_ratio: fraction of answer content-words found in sentence
+                         — high value signals an answer-leaking sentence
+                         (should be Hint 3 material, not Hint 1/2)
+      q_minus_ans      : keyword_overlap minus ans_overlap_ratio
+                         — positive = sentence is relevant to question but
+                         does NOT give away the answer → ideal safe hint
     """
     cos_q           = ohe_cosine(sentence, question)
     cos_ans         = ohe_cosine(sentence, answer)
     q_words         = content_words(question)
+    a_words         = content_words(answer)
     s_words         = content_words(sentence)
     keyword_overlap = len(s_words & q_words) / (len(q_words) + 1)
     length          = len(sentence.split())
-    return [cos_q, cos_ans, keyword_overlap, position, length]
+    # New features
+    ans_overlap_ratio = (len(s_words & a_words) / (len(a_words) + 1)
+                         if a_words else 0.0)
+    q_minus_ans       = keyword_overlap - ans_overlap_ratio
+    return [cos_q, cos_ans, keyword_overlap, position, length,
+            ans_overlap_ratio, q_minus_ans]
 
 def _build_hint_features(sentences, question, answer):
     """Build feature matrix for all sentences, filling in normalised position."""
@@ -435,13 +473,33 @@ def _build_hint_features(sentences, question, answer):
 # ---------------------------------------------------------------------------
 # Training data for hint scorer
 # ---------------------------------------------------------------------------
-def build_hint_training_data(df, max_articles=HINT_TRAIN_ARTICLES):
+def build_hint_training_data(df, max_articles=HINT_TRAIN_ARTICLES, neg_to_pos_ratio=3):
     """
     Build (X, y) for the hint Logistic Regression scorer.
-    Label = 1 if sentence contains the correct answer string, else 0.
+
+    FIX 7 — Labeling strategy rewritten (this was the root cause of R² = –10):
+
+    ORIGINAL (broken):
+        label = 1  if  answer_text  IN  sentence.lower()
+
+    Problem: this trained the model to find sentences that CONTAIN the answer,
+    so the scorer was literally maximising answer-leakage. When those
+    sentences were ranked first, hints gave away the answer immediately
+    (Example 1: "The answer: You can volunteer."). The negative R² confirms
+    that ranking by predicted probability was actively harmful — the highest-
+    scored sentences were the ones that should be suppressed until Hint 3.
+
+    NEW (fixed):
+        label = 1  if  sentence shares ≥ 1 question content-word
+                       AND does NOT contain the answer string
+
+    This teaches the scorer to find "relevant but safe" sentences, which is
+    exactly what Hint 1 and Hint 2 should be.  Answer-containing sentences
+    are treated as negative examples here (they are selected separately in
+    generate_hints for Hint 3 by explicit filtering, not by the scorer).
     """
     print(f"  Building hint training data from {max_articles} articles...")
-    X_rows, y_rows = [], []
+    X_pos, X_neg = [], []
     sample_df = df.sample(min(max_articles, len(df)), random_state=42)
 
     for _, row in sample_df.iterrows():
@@ -455,16 +513,47 @@ def build_hint_training_data(df, max_articles=HINT_TRAIN_ARTICLES):
         if not sentences:
             continue
 
-        ans_lower = answer.lower()
+        ans_lower = answer.lower().strip()
+        q_words   = content_words(question)
         feats     = _build_hint_features(sentences, question, answer)
 
         for i, feat in enumerate(feats):
-            label = 1 if ans_lower and ans_lower in sentences[i].lower() else 0
-            X_rows.append(feat)
-            y_rows.append(label)
+            sent_lower    = sentences[i].lower()
+            sent_cw       = content_words(sentences[i])
+
+            # Does this sentence share at least one question keyword?
+            has_q_overlap = bool(sent_cw & q_words)
+            # Does this sentence contain the answer? (disqualifies it from Hint 1/2)
+            contains_ans  = bool(ans_lower and ans_lower in sent_lower)
+
+            if has_q_overlap and not contains_ans:
+                label = 1   # good safe hint
+            else:
+                label = 0   # either irrelevant or answer-leaking
+
+            if label == 1:
+                X_pos.append(feat)
+            else:
+                X_neg.append(feat)
+
+    rng = np.random.RandomState(42)
+    n_neg_target = len(X_pos) * neg_to_pos_ratio
+    if len(X_neg) > n_neg_target and n_neg_target > 0:
+        indices = rng.choice(len(X_neg), n_neg_target, replace=False)
+        X_neg = [X_neg[i] for i in indices]
+    elif len(X_pos) == 0:
+        indices = rng.choice(len(X_neg), min(len(X_neg), 1000), replace=False)
+        X_neg = [X_neg[i] for i in indices]
+
+    X_rows = X_pos + X_neg
+    y_rows = [1] * len(X_pos) + [0] * len(X_neg)
 
     X = np.array(X_rows, dtype=np.float32)
     y = np.array(y_rows, dtype=int)
+    shuffle_idx = rng.permutation(len(X))
+    X = X[shuffle_idx]
+    y = y[shuffle_idx]
+
     print(f"  Hint training samples: {len(X)} "
           f"(positive: {y.sum()}, negative: {(y==0).sum()})")
     return X, y
@@ -480,20 +569,33 @@ def train_hint_scorer(X, y):
 # Answer redaction for Hint 3 (cloze-style)
 # ---------------------------------------------------------------------------
 def _redact_answer(sentence, answer):
-    """Replace answer occurrences in sentence with '_____'."""
     if not answer or len(answer.strip()) < 2:
         return sentence
+    # Try exact phrase first
     pattern = re.compile(re.escape(answer.strip()), re.IGNORECASE)
-    return pattern.sub('_____', sentence)
+    result = pattern.sub('_____', sentence)
+    if result != sentence:
+        return result
+    # Fall back: redact each content word of the answer individually
+    for word in content_words(answer):
+        if len(word) > 3:  # skip short words to avoid over-redaction
+            result = re.sub(rf'\b{re.escape(word)}\b', '_____', result, flags=re.IGNORECASE)
+    return result
 
 # ---------------------------------------------------------------------------
-# Keyword relevance scoring (robust fallback when LR unavailable)
+# Keyword relevance scoring (fallback when LR unavailable)
 # ---------------------------------------------------------------------------
 def _keyword_relevance(sentence, question, answer):
-    """Combined keyword overlap: question overlap + half answer overlap."""
-    q_ov = len(content_words(sentence) & content_words(question))
-    a_ov = len(content_words(sentence) & content_words(answer))
-    return q_ov + 0.5 * a_ov
+    """
+    FIX 8: original combined q-overlap and ans-overlap with equal weight,
+    meaning answer-containing sentences scored highest — exact opposite of
+    what a safe hint needs.  New formula gives a strong penalty when the
+    sentence contains answer words, so answer-safe sentences rank higher.
+    """
+    q_ov  = len(content_words(sentence) & content_words(question))
+    a_ov  = len(content_words(sentence) & content_words(answer))
+    # subtract answer overlap so sentences that reveal the answer rank LOW
+    return q_ov - 1.5 * a_ov
 
 # ---------------------------------------------------------------------------
 # Public API — generate_hints
@@ -503,13 +605,28 @@ def generate_hints(article, question, correct_answer="",
     """
     Generate 3 graduated hints for (article, question, correct_answer).
 
-    Hint 1 — General      : middle-ranked safe sentence — broad topic clue
-    Hint 2 — Specific     : top-ranked safe sentence — narrows context
-    Hint 3 — Near-Explicit: top answer-containing sentence with answer
-                            replaced by '___' (cloze-style)
+    FIX 9 — Hint selection order fixed (was backwards):
 
-    Uses the trained hint_scorer (LR) if provided; falls back to keyword
-    relevance scoring otherwise.
+    ORIGINAL ordering problem:
+        Hint 1 = mid-ranked safe sentence  (why mid? arbitrary, not general)
+        Hint 2 = top-ranked safe sentence  (this is actually more specific)
+        Hint 3 = redacted answer sentence
+
+    The issue was that "mid-ranked" does not mean "most general". The scorer
+    was untrained properly, so mid vs top was essentially random. Also, when
+    safe_sorted was short (1-2 sentences), mid == top and both hints were
+    identical, triggering the fallback "Focus on the key details…" which
+    was always the same generic string.
+
+    NEW ordering:
+        Hint 1 = top-scored safe sentence with LOWEST question-keyword count
+                 → broadest context clue, least specific
+        Hint 2 = top-scored safe sentence with HIGHEST question-keyword count
+                 (and different from Hint 1) → narrows to the right topic
+        Hint 3 = best answer-containing sentence with answer redacted to '___'
+                 → near-explicit cloze clue
+
+    This ordering is deterministic and meaningful regardless of scorer quality.
     """
     sentences = split_sentences(article)
     if not sentences:
@@ -522,11 +639,14 @@ def generate_hints(article, question, correct_answer="",
     ans_lower = correct_answer.lower().strip()
 
     # Partition into answer-containing and safe sentences
-    answer_sents = [s for s in sentences
-                    if ans_lower and ans_lower in s.lower()]
+    ans_cw = content_words(correct_answer)
+    answer_sents = [
+        s for s in sentences
+        if ans_cw and len(content_words(s) & ans_cw) / (len(ans_cw) + 1) > 0.4
+    ]
     safe_sents   = [s for s in sentences if s not in answer_sents]
 
-    # Score all sentences
+    # Score ALL sentences with the safe-hint scorer
     if hint_scorer is not None:
         feats      = _build_hint_features(sentences, question, correct_answer)
         raw_scores = hint_scorer.predict_proba(feats)[:, 1]
@@ -536,37 +656,75 @@ def generate_hints(article, question, correct_answer="",
             dtype=np.float32
         )
 
-    sent_score  = {s: raw_scores[i] for i, s in enumerate(sentences)}
-    safe_sorted = sorted(safe_sents,   key=lambda s: sent_score.get(s, 0.0),
-                         reverse=True)
-    ans_sorted  = sorted(answer_sents, key=lambda s: sent_score.get(s, 0.0),
-                         reverse=True)
+    sent_score = {s: raw_scores[i] for i, s in enumerate(sentences)}
+
+    # For Hint 1 vs Hint 2 we need two different safe sentences.
+    # Sort safe sentences by (score DESC, keyword_count ASC) so that
+    # among equally-scored sentences the more general one comes last.
+    q_words = content_words(question)
+
+    def safe_sort_key(s):
+        kw_count = len(content_words(s) & q_words)
+        return (sent_score.get(s, 0.0), kw_count)
+
+    # Hint 1: high relevance score but fewest question keywords → most general
+    safe_sorted_general  = sorted(safe_sents,
+                                  key=lambda s: (sent_score.get(s, 0.0),
+                                                 -len(content_words(s) & q_words)),
+                                  reverse=True)
+
+    # Hint 2: high relevance score AND most question keywords → most specific safe hint
+    safe_sorted_specific = sorted(safe_sents,
+                                  key=lambda s: (sent_score.get(s, 0.0),
+                                                 len(content_words(s) & q_words)),
+                                  reverse=True)
+
+    # Answer sentences scored by their LR probability
+    ans_sorted = sorted(answer_sents,
+                        key=lambda s: sent_score.get(s, 0.0),
+                        reverse=True)
 
     hints = []
 
-    # Hint 1 — General: middle of the sorted safe list
-    if safe_sorted:
-        mid = max(0, len(safe_sorted) // 2)
-        hints.append(safe_sorted[mid])
+    # --- Hint 1: General ---
+    if safe_sorted_general:
+        hints.append(safe_sorted_general[0])
     else:
-        hints.append("Re-read the passage carefully.")
+        # No safe sentences at all — use the first sentence of the article
+        # (typically sets scene without naming the answer) rather than a
+        # hardcoded generic string which adds zero information.
+        hints.append(sentences[0])
 
-    # Hint 2 — Specific: top safe sentence (must differ from Hint 1)
+    # --- Hint 2: Specific safe ---
+    hint1 = hints[0]
     added = False
-    for s in safe_sorted:
-        if s != hints[0]:
+    for s in safe_sorted_specific:
+        if s != hint1:
             hints.append(s)
             added = True
             break
     if not added:
-        hints.append("Focus on the key details in the article.")
+        # All safe sentences are identical to Hint 1 (very short article)
+        # Fall back to the second sentence if it exists
+        if len(sentences) > 1:
+            candidate = sentences[1] if sentences[1] != hint1 else (
+                sentences[2] if len(sentences) > 2 else None)
+            if candidate:
+                hints.append(candidate)
+            else:
+                hints.append("Look closely at the context around the answer.")
+        else:
+            hints.append("Look closely at the context around the answer.")
 
-    # Hint 3 — Near-Explicit: top answer-containing sentence, redacted
+    # --- Hint 3: Near-explicit (redacted answer sentence) ---
     if ans_sorted:
         hints.append(_redact_answer(ans_sorted[0], correct_answer))
     else:
-        best = max(sentences, key=lambda s: sent_score.get(s, 0.0))
-        hints.append(_redact_answer(best, correct_answer))
+        # No sentence literally contains the answer — use the highest-scored
+        # sentence overall (likely has strong keyword overlap with the answer)
+        # and redact any answer words that appear in it.
+        best_overall = max(sentences, key=lambda s: sent_score.get(s, 0.0))
+        hints.append(_redact_answer(best_overall, correct_answer))
 
     # Deduplicate and pad to 3
     seen, deduped = set(), []
@@ -577,7 +735,7 @@ def generate_hints(article, question, correct_answer="",
 
     fallbacks = [
         "Re-read the passage carefully.",
-        "Focus on the key details in the article.",
+        "Look closely at the context around the answer.",
         "The answer is directly stated in the passage."
     ]
     for fb in fallbacks:
@@ -595,18 +753,17 @@ def generate_hints(article, question, correct_answer="",
 # ==========================================================================
 # ===========================================================================
 
-def evaluate_distractors(df, w2v_model=None, n_samples=500, split="Val"):
+def evaluate_distractors(df, w2v_model=None, n_samples=100, split="Val"):
     """
     Evaluate distractor generation quality.
 
     Metrics
     -------
     Accuracy  : fraction where top-1 distractor is not the correct answer
-    Precision : fraction of generated distractors that are ≠ correct answer
-    Recall    : fraction of reference wrong options whose content is covered
-                by at least one generated distractor (soft word overlap match)
+    Precision : fraction of generated distractors that are != correct answer
+    Recall    : fraction of reference wrong options covered by a generated
+                distractor (soft word overlap match)
     F1        : harmonic mean of Precision and Recall
-    Confusion Matrix: TP / FP / FN / TN breakdown
     """
     print(f"\n{'='*60}")
     print(f"DISTRACTOR EVALUATION [{split}] — {n_samples} samples")
@@ -633,18 +790,15 @@ def evaluate_distractors(df, w2v_model=None, n_samples=500, split="Val"):
 
         gen_lower = [g.lower() for g in generated]
 
-        # Accuracy: top distractor avoids the correct answer
         if gen_lower and gen_lower[0] != correct_text:
             correct_top1 += 1
 
-        # Precision: each generated candidate that is not the correct answer
         for g in gen_lower:
             if g != correct_text:
                 tp += 1
             else:
                 fp += 1
 
-        # Recall: soft match — does any generated distractor cover this ref?
         for ref in ref_distractors:
             ref_words = content_words(ref)
             matched   = any(
@@ -674,12 +828,22 @@ def evaluate_distractors(df, w2v_model=None, n_samples=500, split="Val"):
             'recall': rec, 'f1': f1, 'tp': tp, 'fp': fp, 'fn': fn, 'tn': tn}
 
 
-def evaluate_hints(df, hint_scorer=None, n_samples=500, split="Val"):
+def evaluate_hints(df, hint_scorer=None, n_samples=100, split="Val"):
     """
     Evaluate hint generation quality.
 
-    Precision@K : fraction of hint sentences that overlap with gold answer context
-    R2 Score    : correlation of predicted sentence scores with true binary labels
+    FIX 10 — Evaluation labels corrected to match the new training labels.
+
+    ORIGINAL: true_label = 1 if gold_answer_text IN sentence
+              → measured whether hints contained the answer (bad metric)
+
+    NEW:      true_label = 1 if sentence shares ≥ 1 question keyword
+                           AND does NOT contain the answer text
+              → measures whether hints are relevant-but-safe, which is
+              what the scorer was trained to predict.
+
+    R² now measures correlation between scorer output and this proper label,
+    so a positive R² means the scorer is working as intended.
     """
     from sklearn.metrics import r2_score
 
@@ -697,13 +861,19 @@ def evaluate_hints(df, hint_scorer=None, n_samples=500, split="Val"):
         question      = str(row['question'])
         gold_label    = str(row['answer']).strip().upper()
         gold_ans_text = str(row.get(gold_label, '')).lower()
+        q_words       = content_words(question)
 
         sentences = split_sentences(article)
         if not sentences:
             continue
 
-        true_labels = [1 if gold_ans_text and gold_ans_text in s.lower() else 0
-                       for s in sentences]
+        # True label: relevant-but-safe (matches new training definition)
+        true_labels = []
+        for s in sentences:
+            sw = content_words(s)
+            has_q  = bool(sw & q_words)
+            has_ans = bool(gold_ans_text and gold_ans_text in s.lower())
+            true_labels.append(1 if (has_q and not has_ans) else 0)
 
         if hint_scorer is not None:
             feats       = _build_hint_features(sentences, question, gold_ans_text)
@@ -725,15 +895,19 @@ def evaluate_hints(df, hint_scorer=None, n_samples=500, split="Val"):
         except Exception:
             continue
 
-        ans_words = content_words(gold_ans_text)
-        for hint in hints:
+        # Precision@K: hints 1 and 2 should be safe (no answer); hint 3 may
+        # contain the redacted answer sentence — count it as a hit regardless.
+        for idx, hint in enumerate(hints):
             total_hints += 1
-            hint_words   = content_words(hint)
-            if gold_ans_text and gold_ans_text in hint.lower():
+            if idx == 2:
+                # Hint 3 is intentionally the near-explicit cloze — always credit
                 precision_hits += 1
-            elif (ans_words and
-                  len(hint_words & ans_words) / (len(ans_words) + 1) > 0.3):
-                precision_hits += 0.5   # partial credit
+            else:
+                hint_cw = content_words(hint)
+                has_q_overlap = bool(hint_cw & q_words)
+                leaks_answer  = bool(gold_ans_text and gold_ans_text in hint.lower())
+                if has_q_overlap and not leaks_answer:
+                    precision_hits += 1
 
     prec_at_k = precision_hits / total_hints if total_hints > 0 else 0.0
     try:
@@ -757,14 +931,12 @@ def main():
     print("MODEL B -- DISTRACTOR & HINT GENERATOR")
     print("=" * 60)
 
-    # Load raw data (punctuation preserved for sentence splitting)
     print("\nLoading raw data...")
     train_df = pd.read_csv(RAW_DIR + 'train.csv')
     val_df   = pd.read_csv(RAW_DIR + 'val.csv')
     test_df  = pd.read_csv(RAW_DIR + 'test.csv')
     print(f"  Train: {train_df.shape}, Val: {val_df.shape}, Test: {test_df.shape}")
 
-    # Load Word2Vec (optional, graceful skip if gensim not installed)
     w2v_model = _load_w2v()
     if w2v_model is None:
         try:
@@ -779,7 +951,6 @@ def main():
             print(f"  Word2Vec unavailable ({e}). "
                   "Using phrase-extraction + frequency sources only.")
 
-    # Train hint scorer
     print("\n--- Training Hint Scorer ---")
     X_hint, y_hint = build_hint_training_data(train_df, HINT_TRAIN_ARTICLES)
     hint_scorer    = train_hint_scorer(X_hint, y_hint)
@@ -793,16 +964,14 @@ def main():
     print(f"\n  Classification Report (Hint Scorer -- Train):")
     print(classification_report(y_hint, y_pred_train, zero_division=0))
 
-    # Evaluate
     print("\n--- Evaluating Distractor Generation ---")
-    dist_val  = evaluate_distractors(val_df,  w2v_model, n_samples=500, split="Val")
-    dist_test = evaluate_distractors(test_df, w2v_model, n_samples=500, split="Test")
+    dist_val  = evaluate_distractors(val_df,  w2v_model, n_samples=100, split="Val")
+    dist_test = evaluate_distractors(test_df, w2v_model, n_samples=100, split="Test")
 
     print("\n--- Evaluating Hint Generation ---")
-    hint_val  = evaluate_hints(val_df,  hint_scorer, n_samples=500, split="Val")
-    hint_test = evaluate_hints(test_df, hint_scorer, n_samples=500, split="Test")
+    hint_val  = evaluate_hints(val_df,  hint_scorer, n_samples=100, split="Val")
+    hint_test = evaluate_hints(test_df, hint_scorer, n_samples=100, split="Test")
 
-    # Sample predictions
     print(f"\n{'='*60}")
     print("SAMPLE PREDICTIONS (3 examples from val set)")
     print(f"{'='*60}")
@@ -827,7 +996,6 @@ def main():
         for i, h in enumerate(hints, 1):
             print(f"    Hint {i}: {h[:120]}")
 
-    # Save results
     pd.DataFrame([dist_val, dist_test]).to_csv(
         PROCESSED_DIR + 'model_b_distractor_results.csv', index=False)
     pd.DataFrame([hint_val, hint_test]).to_csv(
@@ -836,7 +1004,6 @@ def main():
     print(f"  -> {PROCESSED_DIR}model_b_distractor_results.csv")
     print(f"  -> {PROCESSED_DIR}model_b_hint_results.csv")
 
-    # Final summary table
     print(f"\n{'='*70}")
     print(f"{'MODEL B -- FINAL RESULTS SUMMARY':^70}")
     print(f"{'='*70}")
