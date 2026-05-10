@@ -6,119 +6,180 @@ from scipy.sparse import hstack, csr_matrix
 from sklearn.linear_model import LogisticRegression
 from sklearn.svm import LinearSVC
 from sklearn.naive_bayes import BernoulliNB
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (accuracy_score, f1_score,
                              precision_score, recall_score,
                              confusion_matrix, classification_report)
-from sklearn.ensemble import RandomForestClassifier
 
-# Paths 
+# ===========================================================================
+# Paths
+# ===========================================================================
 PROCESSED_DIR = 'data/processed/'
 MODEL_DIR     = 'models/model_a/traditional/'
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-#  Load Features & Raw Binary CSVs 
+# ===========================================================================
+# Load Features
+# ===========================================================================
 def load_features():
     print("Loading features...")
     X_train = joblib.load(PROCESSED_DIR + 'X_train.pkl')
     X_val   = joblib.load(PROCESSED_DIR + 'X_val.pkl')
+    X_test  = joblib.load(PROCESSED_DIR + 'X_test.pkl')
     y_train = joblib.load(PROCESSED_DIR + 'y_train.pkl')
     y_val   = joblib.load(PROCESSED_DIR + 'y_val.pkl')
+    y_test  = joblib.load(PROCESSED_DIR + 'y_test.pkl')
 
+    # FIX: Load binary CSVs that now have separate article/question/option columns
+    # (produced by the corrected preprocessing.py)
     train_df = pd.read_csv(PROCESSED_DIR + 'train_binary.csv')
     val_df   = pd.read_csv(PROCESSED_DIR + 'val_binary.csv')
+    test_df  = pd.read_csv(PROCESSED_DIR + 'test_binary.csv')
 
-    print(f"X_train: {X_train.shape}, X_val: {X_val.shape}")
+    print(f"X_train: {X_train.shape}, X_val: {X_val.shape}, X_test: {X_test.shape}")
     print(f"Label balance (train) — 0: {(y_train==0).sum()}, 1: {(y_train==1).sum()}")
-    return X_train, X_val, y_train, y_val, train_df, val_df
+    return X_train, X_val, X_test, y_train, y_val, y_test, train_df, val_df, test_df
 
-# Handcrafted Lexical Features 
-# These give the model meaningful signal beyond raw word presence:
-#   - keyword_overlap : how many words from the option appear in the article
-#   - option_length   : length of the answer option (normalized)
-#   - question_overlap: how many question words appear in the option
-
-def keyword_overlap(text1, text2):
-    """Fraction of words in text2 that appear in text1."""
-    words1 = set(str(text1).split())
-    words2 = set(str(text2).split())
-    if not words2:
-        return 0.0
-    return len(words1 & words2) / len(words2)
-
+# ===========================================================================
+# Handcrafted Lexical Features
+#
+# FIX: Now uses the REAL article / question / option columns saved by the
+# corrected preprocessing.py instead of the heuristic 80/10/10 split on the
+# combined text string. This makes all 5 features accurate.
+#
+# Features:
+#   f1 — article-option word overlap (fraction of option words in article)
+#   f2 — question-option word overlap (fraction of option words in question)
+#   f3 — option length ratio relative to article
+#   f4 — article coverage (unique article words / total words)
+#   f5 — cosine similarity between (article + question) and option
+# ===========================================================================
 def build_lexical_features(df):
     """
-    df must have columns: text (article+question+option combined)
-    We re-split it back since that's what we have saved.
-    For simplicity we derive features from the combined text.
+    df must have columns: article, question, option
+    (produced by the corrected expand_to_binary in preprocessing.py)
     """
+    # Validate columns — gives a clear error if old preprocessing output is used
+    required = {'article', 'question', 'option'}
+    missing  = required - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"Binary CSV is missing columns: {missing}. "
+            "Re-run preprocessing.py to regenerate with separate columns."
+        )
+
     features = []
     for _, row in df.iterrows():
-        parts = str(row['text']).split()
-        total = len(parts)
+        article_words  = set(str(row['article']).split())
+        question_words = set(str(row['question']).split())
+        option_words   = set(str(row['option']).split())
 
-        # Rough heuristic splits from combined text
-        # article ~ first 80%, question ~ next 10%, option ~ last 10%
-        article_end  = int(total * 0.80)
-        question_end = int(total * 0.90)
+        opt_len   = len(option_words)
+        total_len = len(article_words) + len(question_words) + opt_len
 
-        article_words  = set(parts[:article_end])
-        question_words = set(parts[article_end:question_end])
-        option_words   = set(parts[question_end:])
+        # f1: fraction of option words found in article
+        f1 = len(article_words & option_words) / (opt_len + 1)
 
-        opt_len = len(option_words)
+        # f2: fraction of option words found in question
+        f2 = len(question_words & option_words) / (opt_len + 1)
 
-        f1 = len(article_words  & option_words)  / (opt_len + 1)  # article-option overlap
-        f2 = len(question_words & option_words)  / (opt_len + 1)  # question-option overlap
-        f3 = opt_len / (total + 1)                                  # option length ratio
-        f4 = len(article_words) / (total + 1)                       # article coverage
+        # f3: option length ratio relative to total text length
+        f3 = opt_len / (total_len + 1)
 
-        # Cosine similarity between (article + question) and (option)
-        vocab_aq = article_words | question_words
+        # f4: article lexical coverage
+        f4 = len(article_words) / (total_len + 1)
+
+        # f5: cosine similarity between (article + question) and option
+        vocab_aq  = article_words | question_words
         vocab_all = vocab_aq | option_words
-        v1 = np.array([1 if w in vocab_aq else 0 for w in vocab_all])
-        v2 = np.array([1 if w in option_words else 0 for w in vocab_all])
+        v1 = np.array([1 if w in vocab_aq    else 0 for w in vocab_all], dtype=np.float32)
+        v2 = np.array([1 if w in option_words else 0 for w in vocab_all], dtype=np.float32)
         norm1 = np.linalg.norm(v1)
         norm2 = np.linalg.norm(v2)
-        f5 = np.dot(v1, v2) / (norm1 * norm2) if (norm1 > 0 and norm2 > 0) else 0.0
+        f5 = float(np.dot(v1, v2) / (norm1 * norm2)) if (norm1 > 0 and norm2 > 0) else 0.0
 
         features.append([f1, f2, f3, f4, f5])
 
     return csr_matrix(np.array(features, dtype=np.float32))
 
-# Combine One-Hot  Lexical Features 
+# ===========================================================================
+# Combine One-Hot + Lexical Features
+# ===========================================================================
 def combine_features(X_ohe, X_lex):
     return hstack([X_ohe, X_lex])
 
-# Evaluate 
-def evaluate(name, model, X_val, y_val):
-    preds = model.predict(X_val)
-    acc   = accuracy_score(y_val, preds)
-    f1    = f1_score(y_val, preds, average='macro')
-    prec  = precision_score(y_val, preds, average='macro', zero_division=0)
-    rec   = recall_score(y_val, preds, average='macro', zero_division=0)
-    cm    = confusion_matrix(y_val, preds)
+# ===========================================================================
+# Evaluate — Val AND Test
+#
+# FIX: Evaluation now runs on both val and test sets.
+# FIX: Exact Match (EM) metric added as required by spec Section 4.5.
+#
+# Exact Match here means: for each original question (group of 4 option rows),
+# the model's top-scored option matches the gold correct option.
+# ===========================================================================
+def exact_match_score(model, X, y_bin, n_options=4):
+    """
+    For each group of 4 consecutive rows (one question), check if the model's
+    highest-confidence prediction is the row labeled 1 (correct answer).
 
-    print(f"\n{'='*50}")
-    print(f"Model: {name}")
-    print(f"{'='*50}")
-    print(f"  Accuracy  : {acc:.4f}")
-    print(f"  Macro F1  : {f1:.4f}")
-    print(f"  Precision : {prec:.4f}")
-    print(f"  Recall    : {rec:.4f}")
+    Works with predict_proba models. For LinearSVC uses decision_function.
+    """
+    if hasattr(model, 'predict_proba'):
+        scores = model.predict_proba(X)[:, 1]
+    else:
+        scores = model.decision_function(X)
+
+    n_questions = len(scores) // n_options
+    correct = 0
+    for i in range(n_questions):
+        chunk_scores = scores[i * n_options:(i + 1) * n_options]
+        chunk_labels = y_bin[i * n_options:(i + 1) * n_options]
+        predicted_best = np.argmax(chunk_scores)
+        gold_best      = np.argmax(chunk_labels)   # should be exactly one 1
+        if predicted_best == gold_best:
+            correct += 1
+    return correct / n_questions if n_questions > 0 else 0.0
+
+def evaluate(name, model, X, y, label="Val", compute_em=True):
+    preds = model.predict(X)
+    acc   = accuracy_score(y, preds)
+    f1    = f1_score(y, preds, average='macro')
+    prec  = precision_score(y, preds, average='macro', zero_division=0)
+    rec   = recall_score(y, preds, average='macro', zero_division=0)
+    cm    = confusion_matrix(y, preds)
+    em    = exact_match_score(model, X, y) if compute_em else None
+
+    print(f"\n{'='*55}")
+    print(f"Model: {name}  [{label}]")
+    print(f"{'='*55}")
+    print(f"  Accuracy     : {acc:.4f}")
+    print(f"  Macro F1     : {f1:.4f}")
+    print(f"  Precision    : {prec:.4f}")
+    print(f"  Recall       : {rec:.4f}")
+    if em is not None:
+        print(f"  Exact Match  : {em:.4f}")
     print(f"\nConfusion Matrix:\n{cm}")
-    print(f"\nClassification Report:\n{classification_report(y_val, preds, zero_division=0)}")
+    print(f"\nClassification Report:\n{classification_report(y, preds, zero_division=0)}")
 
-    return {'name': name, 'accuracy': acc, 'f1': f1,
-            'precision': prec, 'recall': rec, 'confusion_matrix': cm}
+    result = {
+        'name': name, 'split': label,
+        'accuracy': acc, 'f1': f1,
+        'precision': prec, 'recall': rec,
+        'exact_match': em,
+        'confusion_matrix': cm
+    }
+    return result
 
-# Train Models 
+# ===========================================================================
+# Train Models
+# ===========================================================================
 def train_logistic_regression(X_train, y_train):
     print("\nTraining Logistic Regression...")
     model = LogisticRegression(
         max_iter=1000,
         solver='saga',
         C=1.0,
-        class_weight='balanced',   # fixes imbalance
+        class_weight='balanced',
         random_state=42
     )
     model.fit(X_train, y_train)
@@ -131,7 +192,7 @@ def train_svm(X_train, y_train):
     model = LinearSVC(
         C=1.0,
         max_iter=2000,
-        class_weight='balanced',   # fixes imbalance
+        class_weight='balanced',
         random_state=42
     )
     model.fit(X_train, y_train)
@@ -141,9 +202,8 @@ def train_svm(X_train, y_train):
 
 def train_naive_bayes(X_train, y_train):
     print("\nTraining Naive Bayes...")
-    # BernoulliNB doesn't support class_weight
-    # so we use sample_weight to replicate balanced weighting
-    weights = np.where(y_train == 1, 3.0, 1.0)   # upweight positives 3x
+    # BernoulliNB doesn't support class_weight — use sample_weight instead
+    weights = np.where(y_train == 1, 3.0, 1.0)
     model = BernoulliNB(alpha=1.0)
     model.fit(X_train, y_train, sample_weight=weights)
     joblib.dump(model, MODEL_DIR + 'naive_bayes.pkl')
@@ -164,57 +224,84 @@ def train_random_forest(X_train, y_train):
     print("Saved → models/model_a/traditional/random_forest.pkl")
     return model
 
-# Comparison Table 
-def print_comparison(results):
-    print(f"\n{'='*60}")
-    print(f"{'MODEL COMPARISON TABLE':^60}")
-    print(f"{'='*60}")
-    print(f"{'Model':<25} {'Accuracy':>10} {'Macro F1':>10} {'Precision':>10} {'Recall':>10}")
-    print(f"{'-'*60}")
-    for r in results:
+
+# ===========================================================================
+# Comparison Table
+# ===========================================================================
+def print_comparison(results, split="Val"):
+    rows = [r for r in results if r['split'] == split]
+    print(f"\n{'='*75}")
+    print(f"{'MODEL COMPARISON TABLE — ' + split:^75}")
+    print(f"{'='*75}")
+    print(f"{'Model':<25} {'Accuracy':>10} {'Macro F1':>10} "
+          f"{'Precision':>10} {'Recall':>10} {'Exact Match':>12}")
+    print(f"{'-'*75}")
+    for r in rows:
+        em_str = f"{r['exact_match']:.4f}" if r['exact_match'] is not None else "  N/A  "
         print(f"{r['name']:<25} {r['accuracy']:>10.4f} {r['f1']:>10.4f} "
-              f"{r['precision']:>10.4f} {r['recall']:>10.4f}")
-    print(f"{'='*60}")
+              f"{r['precision']:>10.4f} {r['recall']:>10.4f} {em_str:>12}")
+    print(f"{'='*75}")
 
-# Main 
+# ===========================================================================
+# Main
+# ===========================================================================
 def main():
-    X_train, X_val, y_train, y_val, train_df, val_df = load_features()
+    X_train, X_val, X_test, y_train, y_val, y_test, \
+        train_df, val_df, test_df = load_features()
 
-    # Build lexical features
-    print("\nBuilding lexical features (this may take a few minutes)...")
+    # Build lexical features using real article/question/option columns
+    print("\nBuilding lexical features...")
     X_lex_train = build_lexical_features(train_df)
     X_lex_val   = build_lexical_features(val_df)
+    X_lex_test  = build_lexical_features(test_df)
     print("Lexical features done.")
 
-    # Combine with One-Hot features
+    # Combine One-Hot + lexical
     X_train_combined = combine_features(X_train, X_lex_train)
     X_val_combined   = combine_features(X_val,   X_lex_val)
+    X_test_combined  = combine_features(X_test,  X_lex_test)
     print(f"Combined feature shape → Train: {X_train_combined.shape}")
 
     results = []
 
-    lr  = train_logistic_regression(X_train_combined, y_train)
-    results.append(evaluate("Logistic Regression", lr, X_val_combined, y_val))
+    # --- Logistic Regression ---
+    lr = train_logistic_regression(X_train_combined, y_train)
+    results.append(evaluate("Logistic Regression", lr, X_val_combined,  y_val,  "Val"))
+    results.append(evaluate("Logistic Regression", lr, X_test_combined, y_test, "Test"))
 
+    # --- Linear SVM ---
     svm = train_svm(X_train_combined, y_train)
-    results.append(evaluate("Linear SVM", svm, X_val_combined, y_val))
+    results.append(evaluate("Linear SVM", svm, X_val_combined,  y_val,  "Val"))
+    results.append(evaluate("Linear SVM", svm, X_test_combined, y_test, "Test"))
 
-    nb  = train_naive_bayes(X_train_combined, y_train)
-    results.append(evaluate("Naive Bayes", nb, X_val_combined, y_val))
+    # --- Naive Bayes ---
+    nb = train_naive_bayes(X_train_combined, y_train)
+    results.append(evaluate("Naive Bayes", nb, X_val_combined,  y_val,  "Val"))
+    results.append(evaluate("Naive Bayes", nb, X_test_combined, y_test, "Test"))
 
+    # --- Random Forest ---
     rf = train_random_forest(X_train_combined, y_train)
-    results.append(evaluate("Random Forest", rf, X_val_combined, y_val))
+    results.append(evaluate("Random Forest", rf, X_val_combined,  y_val,  "Val"))
+    results.append(evaluate("Random Forest", rf, X_test_combined, y_test, "Test"))
 
-    print_comparison(results)
+    # Print comparison tables
+    print_comparison(results, split="Val")
+    print_comparison(results, split="Test")
 
-    # Save combined feature matrices for Model B and ensemble use
+    
+    # Save combined feature matrices for ensemble use
     joblib.dump(X_train_combined, PROCESSED_DIR + 'X_train_combined.pkl')
     joblib.dump(X_val_combined,   PROCESSED_DIR + 'X_val_combined.pkl')
+    joblib.dump(X_test_combined,  PROCESSED_DIR + 'X_test_combined.pkl')
 
-    summary_df = pd.DataFrame([{k: v for k, v in r.items()
-                                 if k != 'confusion_matrix'} for r in results])
+    # Save results (exclude confusion matrix for CSV)
+    summary_df = pd.DataFrame([
+        {k: v for k, v in r.items() if k != 'confusion_matrix'}
+        for r in results
+    ])
     summary_df.to_csv(PROCESSED_DIR + 'model_a_results.csv', index=False)
     print("\nResults saved → data/processed/model_a_results.csv")
+    print("Next step: run model_a_unsupervised.py, then model_a_ensemble.py")
 
 if __name__ == '__main__':
     main()
