@@ -1,3 +1,4 @@
+from sklearn import model_selection
 import joblib
 import numpy as np
 import pandas as pd
@@ -72,9 +73,10 @@ def get_probabilities(model, X, model_name):
 
 def hard_voting(models, X, model_names):
     print("\nRunning Hard Voting...")
-    votes = np.stack([m.predict(X) for m in models], axis=1)  # (n, 3)
-    # Majority vote — if sum >= 2 out of 3, predict 1
-    final_preds = (votes.sum(axis=1) >= 2).astype(int)
+    votes = np.stack([m.predict(X) for m in models], axis=1)  # (n, len(models))
+    # Majority vote
+    threshold = len(models) / 2
+    final_preds = (votes.sum(axis=1) > threshold).astype(int)
     return final_preds
 
 #Soft Voting 
@@ -92,7 +94,7 @@ def soft_voting(models, X, model_names):
 
 #Stacking 
 # Train a meta-classifier (Logistic Regression) on the outputs of base models
-# We use val predictions as meta-features to avoid overfitting
+
 
 def stacking(models, model_names, X_train, y_train, X_val, y_val):
     print("\nBuilding Stacking Ensemble...")
@@ -156,7 +158,7 @@ def stacking(models, model_names, X_train, y_train, X_val, y_val):
     joblib.dump(meta_clf, MODEL_DIR + 'stacking_meta_clf.pkl')
     print("  Saved → models/model_a/traditional/stacking_meta_clf.pkl")
 
-    return val_preds
+    return val_preds, meta_clf
 
 #Final Comparison Table
 def print_final_comparison(results):
@@ -186,22 +188,38 @@ def print_final_comparison(results):
 def main():
     X_train, X_val, y_train, y_val, lr, svm, nb, rf = load_everything()
 
-    models       = [lr, svm, nb, rf]
-    model_names  = ['Logistic Regression', 'Linear SVM', 'Naive Bayes', 'Random Forest']
+    # FIX: Load test set
+    X_test = joblib.load(PROCESSED_DIR + 'X_test_combined.pkl')
+    y_test  = joblib.load(PROCESSED_DIR + 'y_test.pkl')
+
+    models       = [lr, svm, rf]
+    model_names  = ['Logistic Regression', 'Linear SVM', 'Random Forest']
 
     results = []
 
-    # Hard Voting
+    # --- Val Evaluation ---
     hard_preds = hard_voting(models, X_val, model_names)
-    results.append(evaluate("Hard Voting Ensemble", y_val, hard_preds))
+    results.append(evaluate("Hard Voting Ensemble [Val]", y_val, hard_preds))
 
-    # Soft Voting
     soft_preds = soft_voting(models, X_val, model_names)
-    results.append(evaluate("Soft Voting Ensemble", y_val, soft_preds))
+    results.append(evaluate("Soft Voting Ensemble [Val]", y_val, soft_preds))
 
-    # Stacking
-    stack_preds = stacking(models, model_names, X_train, y_train, X_val, y_val)
-    results.append(evaluate("Stacking Ensemble", y_val, stack_preds))
+    stack_preds, meta_clf = stacking(models, model_names, X_train, y_train, X_val, y_val)
+    results.append(evaluate("Stacking Ensemble [Val]", y_val, stack_preds))
+
+    # FIX: Test Evaluation
+    hard_preds_test = hard_voting(models, X_test, model_names)
+    results.append(evaluate("Hard Voting Ensemble [Test]", y_test, hard_preds_test))
+
+    soft_preds_test = soft_voting(models, X_test, model_names)
+    results.append(evaluate("Soft Voting Ensemble [Test]", y_test, soft_preds_test))
+
+    test_meta       = np.column_stack([m.predict(X_test) for m in models])
+    test_probs      = np.hstack([get_probabilities(m, X_test, n)[:, 1].reshape(-1, 1)
+                                 for m, n in zip(models, model_names)])
+    test_meta_full  = np.hstack([test_meta, test_probs])
+    stack_preds_test = meta_clf.predict(test_meta_full)
+    results.append(evaluate("Stacking Ensemble [Test]", y_test, stack_preds_test))
 
     # Final comparison
     print_final_comparison(results)
