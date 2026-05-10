@@ -15,6 +15,7 @@ generate_hints(bundle, article, question, correct_answer) -> list[str]
 run_full_pipeline(bundle, article, options_dict) -> PipelineResult
 """
 
+from sklearn.metrics import confusion_matrix
 import joblib
 import numpy as np
 import pandas as pd
@@ -566,6 +567,13 @@ def run_full_pipeline(bundle: ModelBundle,
         )
         correct_label = gold_answer_label if gold_answer_label else pred_label
         source        = "race_original"
+    # Log for analytics dashboard — needed for Model A live metrics
+        bundle.session_log.append({
+            'task':       'verify_answer',
+            'gold_label': gold_answer_label,
+            'pred_label': pred_label,
+            'latency':    time.time() - t0,
+        })
 
     elif options is not None:
         # Generated mode: generate question, identify best answer
@@ -658,6 +666,72 @@ def get_session_stats(bundle: ModelBundle) -> dict:
         'hint3_cloze_rate':     cloze_rate,
     }
 
+def get_model_a_metrics(bundle: ModelBundle, last_n: int = 50) -> dict:
+    """
+    Compute Model A classification metrics from the last N inference
+    log entries that have gold_label recorded.
+    Returns accuracy, f1, precision, recall, and confusion matrix.
+    """
+    from sklearn.metrics import (accuracy_score, f1_score,
+                                 precision_score, recall_score,
+                                 confusion_matrix)
+
+    log = bundle.session_log
+    # Only entries from verify/identify tasks that have gold labels
+    entries = [e for e in log
+               if e.get('gold_label') and e.get('pred_label')][-last_n:]
+
+    if len(entries) < 2:
+        return None
+
+    y_true = [e['gold_label'] for e in entries]
+    y_pred = [e['pred_label'] for e in entries]
+
+    #use only labels that actually appear in the data
+    present_labels = sorted(list(set(y_true + y_pred)))
+    return {
+        'n':              len(entries),
+        'accuracy':       accuracy_score(y_true, y_pred),
+        'f1':             f1_score(y_true, y_pred, average='macro',
+                                labels=present_labels, zero_division=0),
+        'precision':      precision_score(y_true, y_pred, average='macro',
+                                        labels=present_labels, zero_division=0),
+        'recall':         recall_score(y_true, y_pred, average='macro',
+                                    labels=present_labels, zero_division=0),
+        'confusion_matrix': confusion_matrix(y_true, y_pred,
+                                            labels=present_labels),
+        'labels':         present_labels,
+    }
+
+
+def get_model_b_metrics(bundle: ModelBundle) -> dict:
+    """
+    Load pre-computed Model B ranker metrics from model_b_results.csv
+    saved during training, since distractor ranking is not re-evaluated
+    at inference time.
+    """
+    path = 'data/processed/model_b_results.csv'
+    if not os.path.exists(path):
+        return None
+    df = pd.read_csv(path)
+    ranker_row = df[df['type'] == 'ranker']
+    gen_val    = df[(df['type'] == 'distractor_generation') &
+                   (df['split'] == 'Val')]
+    if ranker_row.empty:
+        return None
+    r = ranker_row.iloc[0]
+    g = gen_val.iloc[0] if not gen_val.empty else None
+    return {
+        'ranker_accuracy':  float(r.get('accuracy', 0)),
+        'ranker_f1':        float(r.get('f1', 0)),
+        'ranker_precision': float(r.get('precision', 0)),
+        'ranker_recall':    float(r.get('recall', 0)),
+        'gen_precision':    float(g['precision']) if g is not None else 0,
+        'gen_recall':       float(g['recall'])    if g is not None else 0,
+        'gen_f1':           float(g['f1'])        if g is not None else 0,
+        'hint_precision':   float(df[df['type']=='hint_generation']['hint_precision'].mean())
+                            if 'hint_precision' in df.columns else 0,
+    }
 
 def export_session_log(bundle: ModelBundle,
                        path: str = 'data/processed/session_log.csv'):

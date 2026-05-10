@@ -820,10 +820,12 @@ def _screen_hints():
 def _screen_dashboard():
     st.markdown("# Analytics Dashboard")
     st.markdown(
-        "<p style='color:#a49dbf'>Performance metrics and session log for "
-        "the current session.</p>",
+        "<p style='color:#a49dbf'>Live session metrics and pre-trained "
+        "model performance.</p>",
         unsafe_allow_html=True,
     )
+
+    from inference import get_model_a_metrics, get_model_b_metrics
 
     bundle = st.session_state.bundle
     if bundle is None:
@@ -832,122 +834,157 @@ def _screen_dashboard():
 
     stats = get_session_stats(bundle)
 
-    if stats["total_requests"] == 0:
-        st.info("No inference calls have been made yet in this session.")
+    # ================================================================
+    # Section 1 — Session Overview
+    # ================================================================
+    st.markdown("## Session Overview")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total Requests",  stats["total_requests"])
+    m2.metric("Avg Latency (s)", f"{stats['avg_latency']:.3f}")
+    m3.metric("Hint Calls",      stats["per_task_counts"].get("generate_hints", 0))
+    m4.metric("Verify Calls",    stats["per_task_counts"].get("verify_answer", 0))
+
+    # ================================================================
+    # Section 2 — Model A Performance (last N inferences)
+    # ================================================================
+    st.markdown("---")
+    st.markdown("## Model A — Answer Verifier Performance")
+
+    last_n = st.slider("Last N inferences", min_value=5,
+                        max_value=200, value=50, step=5)
+    ma = get_model_a_metrics(bundle, last_n=last_n)
+
+    if ma is None:
+        st.info(
+            "Not enough labeled inferences yet. Use RACE mode "
+            "(load a random sample) to accumulate gold-labeled results."
+        )
     else:
-        # ---- Top metrics row ----
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Total Requests",    stats["total_requests"])
-        m2.metric("Avg Latency (s)",   f"{stats['avg_latency']:.3f}")
-        m3.metric("Hint Cloze Rate",
-                  f"{stats.get('hint3_cloze_rate', 0.0):.0%}")
-        hint_calls = stats["per_task_counts"].get("generate_hints", 0)
-        m4.metric("Hint Calls",        hint_calls)
+        st.caption(f"Based on last {ma['n']} labeled inferences")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Accuracy",  f"{ma['accuracy']:.4f}")
+        c2.metric("Macro F1",  f"{ma['f1']:.4f}")
+        c3.metric("Precision", f"{ma['precision']:.4f}")
+        c4.metric("Recall",    f"{ma['recall']:.4f}")
+
+        st.markdown("**Confusion Matrix** (rows = gold, cols = predicted)")
+        cm_df = pd.DataFrame(
+            ma['confusion_matrix'],
+            index=[f"Gold {l}" for l in ma['labels']],
+            columns=[f"Pred {l}" for l in ma['labels']],
+        )
+        st.dataframe(cm_df, use_container_width=True)
+
+    # ================================================================
+    # Section 3 — Model B Performance (from training results)
+    # ================================================================
+    st.markdown("---")
+    st.markdown("## Model B — Distractor Ranker Performance")
+    mb = get_model_b_metrics(bundle)
+
+    if mb is None:
+        st.warning(
+            "model_b_results.csv not found. Run model_b_train.py first."
+        )
+    else:
+        st.caption("Metrics from training evaluation on RACE val set")
+        b1, b2, b3, b4 = st.columns(4)
+        b1.metric("Ranker Accuracy",  f"{mb['ranker_accuracy']:.4f}")
+        b2.metric("Ranker F1",        f"{mb['ranker_f1']:.4f}")
+        b3.metric("Ranker Precision", f"{mb['ranker_precision']:.4f}")
+        b4.metric("Ranker Recall",    f"{mb['ranker_recall']:.4f}")
 
         st.markdown("<br>", unsafe_allow_html=True)
+        g1, g2, g3, g4 = st.columns(4)
+        g1.metric("Gen Precision",    f"{mb['gen_precision']:.4f}")
+        g2.metric("Gen Recall",       f"{mb['gen_recall']:.4f}")
+        g3.metric("Gen F1",           f"{mb['gen_f1']:.4f}")
+        g4.metric("Hint Precision",   f"{mb['hint_precision']:.4f}")
 
-        # ---- Per-task breakdown ----
-        col_a, col_b = st.columns(2)
+    # ================================================================
+    # Section 4 — Per-Request Latency Table
+    # ================================================================
+    st.markdown("---")
+    st.markdown("## Inference Latency — Per Request")
 
-        with col_a:
-            st.markdown("**Request Count by Task**")
-            if stats["per_task_counts"]:
-                task_df = pd.DataFrame(
-                    list(stats["per_task_counts"].items()),
-                    columns=["Task", "Count"],
-                ).set_index("Task")
-                st.dataframe(task_df, use_container_width=True)
+    log = bundle.session_log
+    if not log:
+        st.info("No requests logged yet.")
+    else:
+        log_df = pd.DataFrame(log)
+        # Show relevant columns only
+        show_cols = [c for c in
+                     ['task', 'latency', 'gold_label', 'pred_label']
+                     if c in log_df.columns]
+        log_df = log_df[show_cols].copy()
+        if 'latency' in log_df.columns:
+            log_df['latency'] = log_df['latency'].map(lambda x: f"{x:.4f}s")
+        st.dataframe(log_df.tail(50), use_container_width=True)
 
-        with col_b:
-            st.markdown("**Avg Latency by Task (s)**")
-            if stats["per_task_avg_latency"]:
-                lat_df = pd.DataFrame(
-                    [(t, f"{v:.4f}") for t, v in
-                     stats["per_task_avg_latency"].items()],
-                    columns=["Task", "Avg Latency"],
-                ).set_index("Task")
-                st.dataframe(lat_df, use_container_width=True)
+        # Latency chart
+        if 'latency' in pd.DataFrame(log).columns:
+            chart_df = pd.DataFrame(log)[['latency']].tail(50)
+            st.line_chart(chart_df, use_container_width=True)
 
-        st.markdown("<br>", unsafe_allow_html=True)
-
-    # ---- Last result summary ----
-    if st.session_state.question:
-        st.markdown("---")
-        st.markdown("**Last Pipeline Result**")
-
+    # ================================================================
+    # Section 5 — Last Pipeline Result + Export
+    # ================================================================
+    st.markdown("---")
+    if st.session_state.get("question"):
+        st.markdown("## Last Pipeline Result")
         r1, r2 = st.columns([2, 1])
         with r1:
             st.markdown(
                 f"<div class='rc-card'>"
                 f"<p style='color:#a49dbf;font-size:0.78rem;margin:0'>Question</p>"
                 f"<p style='color:#e8e4ff;margin:0.3rem 0 0 0'>"
-                f"{st.session_state.question}</p>"
-                f"</div>",
+                f"{st.session_state.question}</p></div>",
                 unsafe_allow_html=True,
             )
         with r2:
-            display_correct = st.session_state.get("display_correct_label", st.session_state.correct_label)
+            label = st.session_state.get(
+                "display_correct_label", st.session_state.correct_label)
             st.markdown(
                 f"<div class='rc-card'>"
-                f"<p style='color:#a49dbf;font-size:0.78rem;margin:0'>Correct Label</p>"
-                f"<p style='color:#a78bfa;font-size:1.4rem;font-family:DM Mono,monospace;"
-                f"font-weight:700;margin:0.2rem 0 0 0'>{display_correct}</p>"
-                f"</div>",
+                f"<p style='color:#a49dbf;font-size:0.78rem;margin:0'>"
+                f"Correct Label</p>"
+                f"<p style='color:#a78bfa;font-size:1.4rem;"
+                f"font-family:DM Mono,monospace;font-weight:700;"
+                f"margin:0.2rem 0 0 0'>{label}</p></div>",
                 unsafe_allow_html=True,
             )
 
         if st.session_state.all_scores:
-            st.markdown("**Model A — Verifier Scores (Last Inference)**")
-            display_correct = st.session_state.get("display_correct_label", st.session_state.correct_label)
-            for label, score in sorted(st.session_state.all_scores.items()):
-                is_correct_label = label == display_correct
-                pct = int(score * 100)
-                colour = "#34d399" if is_correct_label else "#6c5ce7"
+            st.markdown("**Verifier Scores**")
+            label = st.session_state.get(
+                "display_correct_label", st.session_state.correct_label)
+            for lbl, score in sorted(st.session_state.all_scores.items()):
+                pct    = int(score * 100)
+                colour = "#34d399" if lbl == label else "#6c5ce7"
                 st.markdown(
                     f"<div style='display:flex;align-items:center;gap:0.8rem;"
-                    f"margin:0.3rem 0;font-size:0.82rem;font-family:DM Mono,monospace'>"
-                    f"<span style='width:20px;color:#a78bfa'>{label}</span>"
+                    f"margin:0.3rem 0;font-size:0.82rem;"
+                    f"font-family:DM Mono,monospace'>"
+                    f"<span style='width:20px;color:#a78bfa'>{lbl}</span>"
                     f"<div class='rc-score-bar-wrap' style='flex:1'>"
-                    f"<div class='rc-score-bar' style='width:{pct}%;background:{colour}'>"
-                    f"</div></div>"
+                    f"<div class='rc-score-bar' "
+                    f"style='width:{pct}%;background:{colour}'></div></div>"
                     f"<span style='width:42px;color:#a49dbf'>{score:.3f}</span>"
-                    f"{'<span style=\"color:#34d399;margin-left:4px\">correct</span>' if is_correct_label else ''}"
+                    f"{'<span style=\"color:#34d399;margin-left:4px\">'
+                       'correct</span>' if lbl == label else ''}"
                     f"</div>",
                     unsafe_allow_html=True,
                 )
 
-        if st.session_state.distractors:
-            st.markdown("**Model B — Generated Distractors**")
-            for i, d in enumerate(st.session_state.distractors, 1):
-                st.markdown(
-                    f"<div style='background:#17142b;border:1px solid #2a2545;"
-                    f"border-radius:6px;padding:0.45rem 0.8rem;margin:0.25rem 0;"
-                    f"font-size:0.85rem;color:#c4bde0;font-family:DM Mono,monospace'>"
-                    f"{i}. {d}</div>",
-                    unsafe_allow_html=True,
-                )
-
-        if st.session_state.hints:
-            st.markdown("**Model B — Generated Hints**")
-            for i, h in enumerate(st.session_state.hints, 1):
-                st.markdown(
-                    f"<div style='background:#17142b;border:1px solid #2a2545;"
-                    f"border-radius:6px;padding:0.45rem 0.8rem;margin:0.25rem 0;"
-                    f"font-size:0.85rem;color:#c4bde0'>"
-                    f"<span class='rc-hint-badge'>Hint {i}</span>{h}</div>",
-                    unsafe_allow_html=True,
-                )
-
         st.markdown(
-            f"<p style='color:#5c5480;font-size:0.78rem;font-family:DM Mono,monospace;"
-            f"margin-top:0.5rem'>Pipeline latency: "
+            f"<p style='color:#5c5480;font-size:0.78rem;"
+            f"font-family:DM Mono,monospace;margin-top:0.5rem'>"
+            f"Pipeline latency: "
             f"{st.session_state.pipeline_latency:.3f}s</p>",
             unsafe_allow_html=True,
         )
 
     st.markdown("---")
-
-    # ---- Export / clear ----
     col_exp, col_clr, _ = st.columns([1, 1, 3])
     with col_exp:
         if st.button("Export Session Log", use_container_width=True):
